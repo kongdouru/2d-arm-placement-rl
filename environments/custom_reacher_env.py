@@ -1,69 +1,114 @@
-import numpy as np
-import gymnasium as gym
-from gymnasium.envs.mujoco import MujocoEnv
-from gymnasium.spaces import Box
-import mujoco
+# environments/custom_reacher_env.py
 import os
+import numpy as np
+import mujoco
+import gymnasium as gym
+from gymnasium.spaces import Box
+from gymnasium.envs.mujoco import MujocoEnv
 
 class CustomReacherEnv(MujocoEnv, gym.utils.EzPickle):
-    def __init__(self, render_mode=None):
-        xml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../assets/reacher_fixed_target.xml"))
+    def __init__(self, render_mode=None, only_first_phase=True):
+        self.only_first_phase = only_first_phase  # 如果 True，第一阶段完成即结束
+        xml_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../assets/reacher_fixed_target.xml")
+        )
         self.frame_skip = 2
 
-        # 动作空间: [joint0, joint1, object_x, object_y]
-        self.action_space = Box(low=-0.5, high=0.5, shape=(4,), dtype=np.float32)
-        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32)
+        # 观测：qpos(2), qvel(2), fingertip(2), target1(2), target2(2)
+        self.observation_space = Box(-np.inf, np.inf, (10,), np.float32)
+        self.action_space      = Box(-0.5, 0.5,   (2,), np.float32)
 
         gym.utils.EzPickle.__init__(self)
-        MujocoEnv.__init__(self, model_path=xml_path, frame_skip=self.frame_skip,
-                           observation_space=self.observation_space, render_mode=render_mode)
+        MujocoEnv.__init__(
+            self,
+            model_path=xml_path,
+            frame_skip=self.frame_skip,
+            observation_space=self.observation_space,
+            render_mode=render_mode,
+        )
 
+        # 保存初始状态
         self.init_qpos = self.data.qpos.ravel().copy()
         self.init_qvel = self.data.qvel.ravel().copy()
 
-        # 记录 object 的 joint id
-        self.object_x_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "obj_x")
-        self.object_y_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "obj_y")
+        # 分阶段：先碰 target1 再碰 target2
+        self.phase = 0
+        self.current_step = 0
+        self.max_steps = 1000
 
+        # 预先查 joint / site id
+        self.j_target1_x = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "target1_x")
+        self.j_target1_y = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "target1_y")
+        self.j_target2_x = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "target2_x")
+        self.j_target2_y = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "target2_y")
+
+        self.s_fingertip = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE,  "fingertip")
+        self.s_target1   = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "target1_site")
+        self.s_target2   = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "target2_site")
+
+        # 为外部脚本 alias
+        self.fingertip_id = self.s_fingertip
+        self.target1_id   = self.s_target1
+        self.target2_id   = self.s_target2
 
     def get_obs(self):
-        qpos = self.data.qpos[:4].copy()
-        qvel = self.data.qvel[:4].copy()
-
-        fingertip_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "fingertip")
-        object_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "object")
-        target_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "target")
-
-        fingertip = self.data.site_xpos[fingertip_id][:2].copy()
-        object_pos = self.data.site_xpos[object_id][:2].copy()
-        target_pos = self.data.site_xpos[target_id][:2].copy()
-
-        return np.concatenate([qpos, qvel, fingertip, object_pos, target_pos])
+        qpos      = self.data.qpos[:2].copy()
+        qvel      = self.data.qvel[:2].copy()
+        fingertip = self.data.site_xpos[self.s_fingertip][:2].copy()
+        t1        = self.data.site_xpos[self.s_target1 ][:2].copy()
+        t2        = self.data.site_xpos[self.s_target2 ][:2].copy()
+        return np.concatenate([qpos, qvel, fingertip, t1, t2])
 
     def step(self, action):
-        # 动作拆分
-        joint_action = action[:2]
-        object_delta = action[2:]
-
-        # 控制机械臂关节
-        self.data.ctrl[0] = np.clip(joint_action[0], -0.5, 0.5)
-        self.data.ctrl[1] = np.clip(joint_action[1], -0.5, 0.5)
-
-        # 移动物体的 joint 位置
-        self.data.qpos[self.object_x_id] = np.clip(self.data.qpos[self.object_x_id] + object_delta[0], -0.3, 0.3)
-        self.data.qpos[self.object_y_id] = np.clip(self.data.qpos[self.object_y_id] + object_delta[1], -0.3, 0.3)
-
-        self.do_simulation(self.data.ctrl, self.frame_skip)
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self.data.ctrl[:] = action
+        self.do_simulation(action, self.frame_skip)
         obs = self.get_obs()
+        self.current_step += 1
 
-        dist = np.linalg.norm(obs[10:12] - obs[12:14])  # object 到 target 的距离
-        reward = -dist + 0.01 * -np.square(action).sum()
-        done = dist < 0.02
+        fingertip = obs[4:6]
+        done = False
+
+        # 阶段1：撞红球
+        if self.phase == 0:
+            dist = np.linalg.norm(fingertip - obs[6:8])
+            reward = -dist
+            if dist < 0.02:
+                reward += 10.0
+                if self.only_first_phase:
+                    done = True
+                    return obs, reward, done, False, {}
+                self.phase = 1
+        else:
+            # 阶段2：撞绿球
+            dist = np.linalg.norm(fingertip - obs[8:10])
+            reward = -dist
+            if dist < 0.02:
+                reward += 10.0
+
+        # 平滑动作惩罚
+        reward -= 0.01 * np.sum(np.square(action))
+
+        # 超时惩罚
+        if self.current_step >= self.max_steps:
+            reward -= 5.0
+            done = True
+
+        # 如果 both 阶段，第二阶段达成终止
+        if not self.only_first_phase and self.phase == 1 and dist < 0.02:
+            done = True
 
         return obs, reward, done, False, {}
 
     def reset_model(self):
-        qpos = self.init_qpos.copy()
-        qvel = self.init_qvel.copy()
+        qpos = self.init_qpos + self.np_random.uniform(-0.1, 0.1, size=self.model.nq)
+        qvel = self.init_qvel + self.np_random.uniform(-0.1, 0.1, size=self.model.nv)
+        low, high = -0.27, 0.27
+        qpos[self.j_target1_x] = self.np_random.uniform(low, high)
+        qpos[self.j_target1_y] = self.np_random.uniform(low, high)
+        qpos[self.j_target2_x] = self.np_random.uniform(low, high)
+        qpos[self.j_target2_y] = self.np_random.uniform(low, high)
         self.set_state(qpos, qvel)
+        self.phase = 0
+        self.current_step = 0
         return self.get_obs()

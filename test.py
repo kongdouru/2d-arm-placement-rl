@@ -5,10 +5,11 @@ import time
 env = CustomReacherEnv(render_mode="human")
 obs, _ = env.reset()
 
-for _ in range(200):
-    action = np.array([0.2, 0.2])  # 只控制 joint0、joint1
+for i in range(300):
+    action = np.random.uniform(low=-0.5, high=0.5, size=(2,))
     obs, reward, done, _, _ = env.step(action)
-    print("Reward:", reward)
+    env.render()
+    print(f"Step {i}: Reward = {reward:.3f}, Obs = {obs}")
     time.sleep(0.05)
 
 env.close()
