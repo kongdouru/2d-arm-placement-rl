@@ -1,84 +1,109 @@
-
-# train.py
+import os
 import numpy as np
 import torch
-import os
+from gymnasium.wrappers import TimeLimit
 from environments.custom_reacher_env import CustomReacherEnv
 from td3 import TD3
 from replay_buffer import ReplayBuffer
 
-env = CustomReacherEnv(render_mode=None, only_first_phase=False)
-state_dim  = env.observation_space.shape[0]
+raw_env = CustomReacherEnv(render_mode=None, only_first_phase=False, max_steps=50)
+env = TimeLimit(raw_env, max_episode_steps=100)
+
+state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.shape[0]
 max_action = float(env.action_space.high[0])
 
-agent        = TD3(state_dim, action_dim, max_action)
-replay_buffer= ReplayBuffer(state_dim, action_dim)
+agent = TD3(state_dim, action_dim, max_action)
+replay_buffer = ReplayBuffer(state_dim, action_dim)
 
-# 超参数
-max_timesteps   = 50_000
-start_timesteps = 2_000
-batch_size      = 256
-expl_noise      = 0.1
-eval_freq       = 5_000
-log_freq        = 1_000
-save_dir        = "results"
+max_timesteps = 200_0000
+start_timesteps = 10_000
+batch_size = 256
+expl_noise = 0.1 * max_action
+
+eps_start = 0.1
+eps_end = 0.01
+eps_decay = max_timesteps
+
+discount = 0.99
+tau = 0.005
+policy_noise = 0.2 * max_action
+noise_clip = 0.5 * max_action
+policy_freq = 2
+
+eval_freq = 5_000  # 缩短评估频率，更早触发模型保存
+log_freq = 1_000
+
+save_dir = "results_td3"
 os.makedirs(save_dir, exist_ok=True)
-best_eval_reward= -np.inf
+
+best_eval = -np.inf
+ep_num = 0
+ep_steps = 0
+ep_reward = 0.0
 
 state, _ = env.reset()
-episode_reward=0.0
-episode_timesteps=0
-episode_num=0
+print(f"Episode {ep_num} start, red at {raw_env.data.site_xpos[raw_env.target1_id][:2]}")
 
-print("开始训练...")
-for t in range(1, max_timesteps+1):
-    episode_timesteps += 1
+for t in range(1, max_timesteps + 1):
+    ep_steps += 1
+
     if t < start_timesteps:
         action = env.action_space.sample()
     else:
-        action = agent.select_action(np.array(state))
-        action += np.random.normal(0, expl_noise, size=action_dim)
-        action = np.clip(action, env.action_space.low, env.action_space.high)
+        eps = eps_end + (eps_start - eps_end) * max(0, (eps_decay - t) / eps_decay)
+        if np.random.rand() < eps:
+            action = env.action_space.sample()
+        else:
+            action = agent.select_action(np.array(state))
+            action = (action + np.random.normal(0, expl_noise, size=action_dim)).clip(
+                env.action_space.low, env.action_space.high
+            )
 
     next_state, reward, done, truncated, _ = env.step(action)
     replay_buffer.add(state, action, next_state, reward, float(done or truncated))
     state = next_state
-    episode_reward += reward
-
-    if done or truncated:
-        print(f"Episode {episode_num} | Steps: {episode_timesteps} | Reward: {episode_reward:.2f}")
-        state, _ = env.reset()
-        episode_reward=0.0
-        episode_timesteps=0
-        episode_num+=1
-
-    if t % log_freq == 0:
-        ft = env.data.site_xpos[env.fingertip_id][:2]
-        t1 = env.data.site_xpos[env.target1_id][:2]
-        t2 = env.data.site_xpos[env.target2_id][:2]
-        d1 = np.linalg.norm(ft - t1)
-        d2 = np.linalg.norm(ft - t2)
-        print(f"Time {t} | EpReward {episode_reward:.2f} | d1={d1:.3f}, d2={d2:.3f}")
+    ep_reward += reward
 
     if t >= start_timesteps:
-        agent.train(replay_buffer, batch_size)
+        agent.train(
+            replay_buffer,
+            batch_size,
+            discount=discount,
+            tau=tau,
+            policy_noise=policy_noise,
+            noise_clip=noise_clip,
+            policy_freq=policy_freq,
+        )
+
+    if done or truncated:
+        print(f"Episode {ep_num} | Steps: {ep_steps} | Reward: {ep_reward:.2f}")
+        state, _ = env.reset()
+        print(f"Episode {ep_num + 1} start, red at {raw_env.data.site_xpos[raw_env.target1_id][:2]}")
+        ep_num += 1
+        ep_steps = 0
+        ep_reward = 0.0
+
+    if t % log_freq == 0:
+        ft = raw_env.data.site_xpos[raw_env.fingertip_id][:2]
+        t1 = raw_env.data.site_xpos[raw_env.target1_id][:2]
+        t2 = raw_env.data.site_xpos[raw_env.target2_id][:2]
+        print(f"Time {t} | EpR {ep_reward:.2f} | d1={np.linalg.norm(ft - t1):.3f}, d2={np.linalg.norm(ft - t2):.3f}")
 
     if t % eval_freq == 0:
-        # 简单 eval: avg reward
         avg_r = 0.0
         for _ in range(5):
-            s,_ = env.reset()
-            done=False
+            s, _ = env.reset()
+            done = False
             while not done:
                 a = agent.select_action(np.array(s))
                 s, r, done, *_ = env.step(a)
                 avg_r += r
-        avg_r /=5
+        avg_r /= 5
         print(f"Eval {t}: avg_r={avg_r:.2f}")
-        if avg_r>best_eval_reward:
-            best_eval_reward=avg_r
-            print("新最优，保存模型")
+        if avg_r > best_eval:
+            best_eval = avg_r
+            print("New best, saving models")
             torch.save(agent.actor.state_dict(), f"{save_dir}/best_actor.pth")
             torch.save(agent.critic.state_dict(), f"{save_dir}/best_critic.pth")
         torch.save(agent.actor.state_dict(), f"{save_dir}/actor_{t}.pth")

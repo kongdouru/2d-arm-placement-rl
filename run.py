@@ -12,7 +12,7 @@ max_action = float(env.action_space.high[0])
 
 # 加载训练好的 Actor 模型（请修改路径，确保文件存在）
 actor = Actor(state_dim, action_dim, max_action).cuda()
-actor.load_state_dict(torch.load("results/best_actor.pth", map_location="cuda"))
+actor.load_state_dict(torch.load("results_td3/best_actor.pth", map_location="cuda"))
 actor.eval()
 
 n_episodes = 5
@@ -27,7 +27,7 @@ for ep in range(n_episodes):
         state, reward, done, truncated, _ = env.step(action)
         ep_reward += reward
         env.render()  # 更新渲染窗口
-        time.sleep(0.02)  # 控制渲染速度
+        time.sleep(0.1)  # 控制渲染速度
 
         if done or truncated:
             break
