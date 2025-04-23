@@ -5,7 +5,9 @@ from gymnasium.wrappers import TimeLimit
 from environments.custom_reacher_env import CustomReacherEnv
 from td3 import TD3
 from replay_buffer import ReplayBuffer
+import matplotlib.pyplot as plt
 
+# --------- 环境与代理初始化 ---------
 raw_env = CustomReacherEnv(render_mode=None, only_first_phase=False, max_steps=50)
 env = TimeLimit(raw_env, max_episode_steps=100)
 
@@ -16,7 +18,8 @@ max_action = float(env.action_space.high[0])
 agent = TD3(state_dim, action_dim, max_action)
 replay_buffer = ReplayBuffer(state_dim, action_dim)
 
-max_timesteps = 200_0000
+# --------- 超参数 ---------
+max_timesteps = 2_000_000
 start_timesteps = 10_000
 batch_size = 256
 expl_noise = 0.1 * max_action
@@ -31,23 +34,31 @@ policy_noise = 0.2 * max_action
 noise_clip = 0.5 * max_action
 policy_freq = 2
 
-eval_freq = 5_000  # 缩短评估频率，更早触发模型保存
+eval_freq = 5_000
 log_freq = 1_000
 
+# --------- 保存目录 ---------
 save_dir = "results_td3"
 os.makedirs(save_dir, exist_ok=True)
 
+# --------- 数据记录 ---------
 best_eval = -np.inf
+reward_history = []
+eval_log = []
+
 ep_num = 0
 ep_steps = 0
 ep_reward = 0.0
 
+# 首次重置
 state, _ = env.reset()
 print(f"Episode {ep_num} start, red at {raw_env.data.site_xpos[raw_env.target1_id][:2]}")
 
+# --------- 训练主循环 ---------
 for t in range(1, max_timesteps + 1):
     ep_steps += 1
 
+    # 动作选择
     if t < start_timesteps:
         action = env.action_space.sample()
     else:
@@ -60,11 +71,13 @@ for t in range(1, max_timesteps + 1):
                 env.action_space.low, env.action_space.high
             )
 
+    # 环境交互
     next_state, reward, done, truncated, _ = env.step(action)
     replay_buffer.add(state, action, next_state, reward, float(done or truncated))
     state = next_state
     ep_reward += reward
 
+    # 学习更新
     if t >= start_timesteps:
         agent.train(
             replay_buffer,
@@ -76,20 +89,24 @@ for t in range(1, max_timesteps + 1):
             policy_freq=policy_freq,
         )
 
+    # 回合结束
     if done or truncated:
         print(f"Episode {ep_num} | Steps: {ep_steps} | Reward: {ep_reward:.2f}")
+        reward_history.append(ep_reward)
         state, _ = env.reset()
         print(f"Episode {ep_num + 1} start, red at {raw_env.data.site_xpos[raw_env.target1_id][:2]}")
         ep_num += 1
         ep_steps = 0
         ep_reward = 0.0
 
+    # 日志输出
     if t % log_freq == 0:
-        ft = raw_env.data.site_xpos[raw_env.fingertip_id][:2]
+        ft = raw_env.data.site_xpos[raw_env.s_fingertip][:2]
         t1 = raw_env.data.site_xpos[raw_env.target1_id][:2]
         t2 = raw_env.data.site_xpos[raw_env.target2_id][:2]
         print(f"Time {t} | EpR {ep_reward:.2f} | d1={np.linalg.norm(ft - t1):.3f}, d2={np.linalg.norm(ft - t2):.3f}")
 
+    # 评估并记录
     if t % eval_freq == 0:
         avg_r = 0.0
         for _ in range(5):
@@ -101,6 +118,7 @@ for t in range(1, max_timesteps + 1):
                 avg_r += r
         avg_r /= 5
         print(f"Eval {t}: avg_r={avg_r:.2f}")
+        eval_log.append((t, avg_r))
         if avg_r > best_eval:
             best_eval = avg_r
             print("New best, saving models")
@@ -108,3 +126,33 @@ for t in range(1, max_timesteps + 1):
             torch.save(agent.critic.state_dict(), f"{save_dir}/best_critic.pth")
         torch.save(agent.actor.state_dict(), f"{save_dir}/actor_{t}.pth")
         torch.save(agent.critic.state_dict(), f"{save_dir}/critic_{t}.pth")
+
+# --------- 训练结束：保存与绘图 ---------
+np.save(os.path.join(save_dir, "reward_history.npy"), np.array(reward_history))
+np.save(os.path.join(save_dir, "eval_log.npy"), np.array(eval_log))
+
+# 绘制 Reward 收敛曲线
+plt.figure(figsize=(8,5))
+plt.plot(reward_history, label="Episode Reward")
+plt.xlabel("Episode")
+plt.ylabel("Total Reward")
+plt.title("TD3 Training Reward Convergence")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "learning_curve.png"))
+
+# 绘制 Eval 曲线
+data = np.array(eval_log)
+ts, avg_r = data[:,0], data[:,1]
+plt.figure(figsize=(8,5))
+plt.plot(ts, avg_r, '-o', label='Avg Eval Reward')
+plt.xlabel("Timestep")
+plt.ylabel("Average Eval Reward")
+plt.title("Evaluation Performance Over Training")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "eval_curve.png"))
+
+print(f"Saved reward_history.npy, learning_curve.png, eval_log.npy, eval_curve.png in {save_dir}")
